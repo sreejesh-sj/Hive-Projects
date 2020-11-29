@@ -1,0 +1,470 @@
+Creditcard Defaulters and Insurance Premium Batch Project 
+------------------------------------------------------------
+Linux shell, script, python, Sqoop, HDFS, Hive, Hbase and Phoenix.
+--------------------------------------------------------------------
+
+=> Data will be persisted into Hadoop file system, HBASE and Hive are injected using Sqoop for data exchange from DB sources.
+=> SFTP/SCP for file transfer from Cloud Platform
+=> Data transformation and processing such as aggregation, filtering, grouping using Hive for Batch data 
+   and Phoenix for online data access on Hbase for realtime data aggregation and reporting as per the reporting needs.
+
+
+Project Flow:
+
+1. Data ingestion and acquisition is done through Sqoop from RDBMS and into Linux file system from Cloud or any other sources.
+
+2. Merge the 2 dataset using hive and split the defaulters and non-defaulters into 2 data sets and load into hdfs.
+
+3. Create a hive table with header line count as 1.
+
+4. Create one more fixed width hive table to load the fixed width states_fixed width data.
+
+5. Create and load penality data into the hive table serialized with orc.
+
+6. Export the Defaulters and Non Defaulters data into HDFS with comma delimiter, where non defaulters data added with trailer data for consumer systems validation.
+
+7. Perform dist copy of non defaulters data from Prod cluster to non prod clusters that will be used for analytics purposes.
+
+8. Run a shell script to pull the data from Cloud S3, validate, remove trailer data, move to HDFS and archive the data for backup
+
+9. Create a partitioned table and run a shell script to which has to generate the load command and it has to load the data into the below insurance table   	 automatically
+
+10. Create a fixed width hive table to load the fixed width states_fixedwidth data using Regex Serde
+
+11. Apply Data Governance - Redaction and Masking using Hive and Python
+
+12. Data Provisioning to the Consumers into legacy Databases using Sqoop including Validation
+
+13. Complex type ETL using Hive
+
+14. Data movement & migration from DB to HBase using Sqoop
+
+15. Data movement & migration from Hive to HBase using Storage Handler
+
+16. Data Provisioning to the Consumers using Apache Phoenix to support Realtime aggregation and Low Latency Query processing
+
+17. Write queries to build cubes at different levels to aggregate the data in realtime to populate in the report such as average age, sum of bill amount, average bill amount etc.,
+
+
+1. Create a database in hive as insure.
+
+create database if not exists insure;
+
+
+2. Sqoop import the data into hive table insure.credits_pst and insure.credits_cst with options such as hive overwrite, number of mappers 2,
+ where hive table created by sqoop with id as bigint, billamt as float 
+ 
+sqoop import --connect jdbc:mysql://localhost/custdb --username root --password root --table credits_pst --target-dir /user/hduser/credits_pst --delete-target-dir \
+--split-by id -m 2 --hive-overwrite --hive-import --hive-table insure.credits_pst --map-column-hive id=bigint,billamt=float 
+
+sqoop import --connect jdbc:mysql://localhost/custdb --username root --password root --table credits_cst --target-dir /user/hduser/credits_cst --delete-target-dir \
+--split-by id -m 2 --hive-overwrite --hive-import --hive-table insure.credits_cst --map-column-hive id=bigint,billamt=float 
+
+
+3. Filter the cst and pst tables with the billamt > 0 and union all both dataset and load into a single table called insure.cstpstreorder 
+using create table as select (CTAS)
+
+create table insure.cstpstreorder
+as 
+select a.* from credits_cst a where billamt>0
+union all
+select b.* from credits_pst b where billamt>0;
+
+
+4. Note: We can merge the step 2 and 3 and make the above 2 sqoop statements as 1 sqoop
+statement to directly import data into the insure.cstpstreorder by writing –query with billamt>0
+filter and union of both credits_pst and credits_cst at the MYSQL level itself finally convert the
+insure.cstpstreorder into external table. If you have some time try it out..
+
+sqoop import --connect jdbc:mysql://localhost/custdb --username root --password root  \
+--query 'select a.* from credits_cst a where a.billamt>0 and $CONDITIONS' 
+union all select b.* from credits_pst b where b.billamt>0 and $CONDITIONS' \
+--delete-target-dir --target-dir /user/hduser/credits_cstpst1 -m 1 --hive-overwrite --hive-import --hive-table insure.cstpstreorder1 \
+--map-column-hive id=bigint,billamt=float
+
+5. Create another external table insure.cstpstpenality in orc file format (show create table
+insure.cstpstreorder) to get the ddl of the above table and alter as per the below columns for
+faster table creation and populate with the below ETL transformations applied in the above
+table cstpstreorder as given below
+
+CREATE external TABLE `insure.cstpstpenality`(
+`id` bigint,
+`issuerid1` int,
+`issuerid2` int,
+`lmt` int,
+`newlmt` int,
+`sex` int,
+`edu` int,
+`marital` int,
+`pay` int,
+`billamt` float,
+`newbillamt` float,
+`defaulter` int)
+stored as orc
+LOCATION
+'/user/hduser/cstpstpenality';
+
+
+a. id,issuerid1,issuerid2,lmt,case defaulter when 1 then lmt-(lmt*0.04) else lmt end as
+newlmt ,sex,edu,marital,pay,billamt,case defaulter when 1 then billamt+(billamt*0.02) else
+billamt end as newbillamt, defaulter;
+
+insert into table insure.cstpstpenality 
+select id,issuerid1,issuerid2,lmt,case defaulter when 1 then lmt-(lmt*0.04) else lmt end as newlmt,
+sex,edu,marital,pay,billamt,case defaulter when 1 then billamt+(billamt*0.02) else billamt end as newbillamt,defaulter
+from insure.cstpstreorder;
+
+
+Data Provisioning using Hive, Sqoop and DistCp
+-------------------------------------------------
+
+b. Export and overwrite the above data into /user/hduser/defaultersout/ we will be using
+this defaultersout data in a later point of time and /user/hduser/nondefaultersout/
+locations with defaulter=1 and defaulter=0 respectively using ‘,’ delimiter. We will be
+sending this nondefaultersout data to external systems using Distcp/SFTP.
+
+
+insert overwrite directory '/user/hduser/defaultersout/'
+row format delimited fields terminated by ', '
+select * from insure.cstpstpenality
+where defaulter=1;
+
+
+insert overwrite directory '/user/hduser/nondefaultersout/'
+row format delimited fields terminated by ', '
+select concat(id, ', ', issuerid1, ', ', issuerid2, ', ', lmt, ', ', newlmt, ', ', sex, ', ', edu, ', ', marital,
+',', pay, ', ', billamt, ', ', newbillamt, ', ', defaulter ) as cnt from insure.cstpstpenality
+where defaulter=0
+union
+select concat('Trl|',count(1)) as cnt from (select * from insure.cstpstpenality
+where defaulter=0) as tmp;
+
+
+Data Provisioning to the Consumers using DistCP
+------------------------------------------------
+
+hadoop distcp -overwrite hdfs://localhost:54310/user/hduser/nondefaultersout/
+hdfs://localhost:54310/tmp/promocustomers
+
+Execute the below shell script to pull the data from Cloud S3, validate, remove trailer data, move to HDFS and archive the data for backup.
+-------------------------------------------------------------------------------------------------------------------------------------------
+
+bash sfm_insuredata.sh https://s3.amazonaws.com/in.inceptez.bucket1/insurance_project/insuranceinfo.csv
+
+
+Ensure data is imported from cloud to hdfs and get the date and take a note of the timestamp in the file
+-------------------------------------------------------------------------------------------------------------
+
+hadoop fs -ls /user/hduser/insurance_clouddata
+
+
+
+ETL & ELT using Hive
+------------------------
+
+Create a partitioned table and load manually or by modifying the below script which has to generate
+the load command and it has to load the data into the below insurance table automatically.
+
+
+CREATE TABLE insurance (IssuerId1 int,IssuerId2 int,BusinessYear int,StateCode string,SourceName string,NetworkName string,
+NetworkURL string,RowNumber int,MarketCoverage string,DentalOnlyPlan string)
+Partitioned by (datadt date,hr int)
+row format delimited fields terminated by ','
+TBLPROPERTIES ("skip.header.line.count"="1");
+
+bash /home/hduser/creditcard_insurance/hivepart.sh /user/hduser/insurance_clouddata insure.insurance creditcard_insurance
+
+/tmp/hive on HDFS should be writable. Current permissions are: rwx------
+
+hadoop fs -chmod -R 777 /tmp/hive
+
+Delete the invalid data with null issuerid1 and issuerid2 using insert select query
+---------------------------------------------------------------------------------------
+
+insert overwrite table insurance partition(datadt,hr) select * from insurance where issuerid1 is not null and issuerid2 is not null;
+
+
+Create a fixed width hive table to load the fixed width states_fixedwidth data using Regex Serde
+-------------------------------------------------------------------------------------------------
+
+drop table if exists insure.state_master;
+
+CREATE EXTERNAL TABLE insure.state_master (statecd STRING, statedesc STRING)
+ROW FORMAT SERDE 'org.apache.hadoop.hive.contrib.serde2.RegexSerDe'
+WITH SERDEPROPERTIES ("input.regex" = "(.{2})(.{20})" )
+LOCATION '/user/hduser/states';
+
+load data local inpath '/home/hduser/creditcard_insurance/states_fixedwidth' overwrite into table
+insure.state_master;
+
+
+Create a managed table on top of the hive output defaulter’s dataset created in step 5.b given above.
+--------------------------------------------------------------------------------------------------------
+use insure;
+
+CREATE TABLE defaulters (id int,IssuerId1 int,IssuerId2 int,lmt int,newlmt double,sex int,edu int,marital
+int,pay int,billamt int,newbillamt float,defaulter int)
+row format delimited fields terminated by ','
+LOCATION '/user/hduser/defaultersout';
+
+
+Create a final managed table (later convert to external table) in orc with snappy compression and load
+the above 2 tables joined by applying different functions.
+
+
+This table should not allow duplicates when it is not empty or if not using overwrite option
+
+
+use insure;
+
+CREATE TABLE insurancestg (IssuerId int,BusinessYear int,StateCode string,statedesc string,SourceName
+string,NetworkName string,NetworkURL string,RowNumber int,MarketCoverage string,DentalOnlyPlan
+string,id int,lmt int,newlmt int,reduced_lmt int,sex varchar(6),grade varchar(20),marital int,pay
+int,billamt int,newbillamt float,penality float,defaulter int)
+row format delimited fields terminated by ','
+LOCATION '/user/hduser/insurancestg';
+
+
+insert overwrite table insurancestg select concat(i.IssuerId1,i.IssuerId2) as
+issuerid,i.businessyear,i.statecode,s.statedesc as
+statedesc,i.sourcename,i.networkname,i.networkurl,i.rownumber,i.marketcoverage,i.dentalonlyplan,
+d.id,d.lmt,d.newlmt,d.newlmt-d.lmt as reduced_lmt,case when d.sex=1 then 'male' else 'female' end as
+sex ,case when d.edu=1 then 'lower grade' when d.edu=2 then 'lower middle grade' when d.edu=3 then
+'middle grade' when d.edu=4 then 'higher grade' when d.edu=5 then 'doctrate grade' end as grade
+,d.marital,d.pay,d.billamt,d.newbillamt,d.newbillamt-d.billamt as penality,d.defaulter
+from insurance i inner join defaulters d
+on (i.IssuerId1=d.IssuerId1 and i.IssuerId2=d.IssuerId2)
+inner join state_master s
+on (i.statecode=s.statecd);
+
+hadoop fs -rm -r -f /user/hduser/insuranceorc;
+drop table if exists insuranceorc;
+
+
+CREATE TABLE insuranceorc (IssuerId int,BusinessYear int,StateCode string,statedesc string,SourceName
+string,NetworkName string,NetworkURL string,RowNumber int,MarketCoverage string,DentalOnlyPlan
+string,id int,lmt int,newlmt int,reduced_lmt int,sex varchar(6),grade varchar(20),marital int,pay
+int,billamt int,newbillamt float,penality int,defaulter int)
+row format delimited fields terminated by ','
+stored as orc
+LOCATION '/user/hduser/insuranceorc'
+TBLPROPERTIES ("immutable"="true","orc.compress"="SNAPPY");
+
+
+Insert into insuranceorc select * from insurancestg where issuerid is not null;
+
+
+Convert the above table from managed to external, usually we use the below statement if we can’t
+create external table in the initial stage itself for example sqoop import hive table can’t be created as
+external initially.
+
+
+alter table insuranceorc SET TBLPROPERTIES('EXTERNAL'='TRUE');
+
+
+write common table expression queries in hive
+-------------------------------------------------
+
+with T1 as ( select max(penality) as penalitymale from insuranceorc where sex='male'),
+T2 as ( select max(penality) as penalityfemale from insuranceorc where sex='female')
+select penalitymale,penalityfemale
+from T1 inner join T2
+ON 1=1;
+
+
+
+Data Governance - Redaction and Masking using Hive and Python
+--------------------------------------------------------------
+
+create view in hive to restrict few columns, store queries, and apply some masking on sensitive
+columns using either query or by using the mask_insure.py function given in the project document.
+
+drop view if exists middlegradeview;
+
+
+create view middlegradeview as
+select issuerid,businessyear,statedesc,sourcename, sex,grade,marital,newbillamt,defaulter
+,translate(translate(translate(translate(translate(networkurl,'a','x'),'b','y'),'c','z'),'s','r'),'.com','.aaa') as
+maskednetworkurl
+from insuranceorc
+where grade='middle grade'
+and issuerid is not null;
+
+
+(or)
+
+
+create view middlegradeview as
+select transform(issuerid,businessyear,statedesc,sourcename, defaulter ,networkurl) using 'python /home/hduser/creditcard_insurance/mask_insure.py'
+as (issuerid,businessyear,statedesc,sourcename, defaulter ,maskednetworkurl)
+from insuranceorc
+where grade='middle grade'
+and issuerid is not null;
+
+select * from middlegradeview limit 10;
+
+
+Export the above view data into hdfs location /user/hduser/defaulterinfo with the pipe ‘|’ delimiter the following columns
+issuerid,businessyear,statedesc,sourcename,maskednetworkurl,defaulter
+
+insert overwrite directory '/user/hduser/defaulterinfo/'
+row format delimited fields terminated by '|'
+select * from insure.middlegradeview
+where defaulter=1;
+
+
+Data Provisioning to the Consumers into legacy Databases using Sqoop including Validation
+--------------------------------------------------------------------------------------------
+
+Data export using Sqoop into DB
+---------------------------------
+
+drop table if exists middlegrade;
+
+create table middlegrade (issuerid integer,businessyear integer,maskedstatedesc
+varchar(200),maskedsourcename varchar(100), defaulter varchar(20),maskednetworkurl varchar(200));
+
+1. Export the masked data into mysql using sqoop export as per the above table structure.
+
+2. Validate the export is properly happened using --validate option in sqoop
+
+sqoop export --connect jdbc:mysql://127.0.0.1/custdb --username root --password root --table middlegrade \
+--export-dir /user/hduser/defaulterinfo/ --fields-terminated-by '|' -validate
+
+
+Complex type ETL using Hive
+-----------------------------
+
+Create a Complex type table to understand how to group the like issuers in a single row using array, struct and map.
+-----------------------------------------------------------------------------------------------------------------------
+
+Create table insuranceorc_collection
+row format delimited collection items terminated by ', '
+stored as orcfile
+location '/user/hduser/insuranceorc_collection/'
+as select issuerid,named_struct('marital',marital,'sex',sex,'grade',grade) as
+personalinfo,collect_set(networkname) as networkname, collect_set(networkurl) networkurl
+from insuranceorc group by issuerid,named_struct('marital',marital,'sex',sex,'grade',grade);
+
+
+alter table insuranceorc_collection SET TBLPROPERTIES('EXTERNAL'='TRUE');
+
+Select only the issuerid,grade,second networkname,second networkurl where we have more than 1 networkname and networkurl accessed by the customers.
+-----------------------------------------------------------------------------------------------------------------------------------------------------
+
+Select issuerid,personalinfo.grade,networkname[1],networkurl[1] from insuranceorc_collection where
+size(networkname)=2 and size(networkurl)=2;
+
+
+
+Data movement & migration from DB to HBase using Sqoop
+==========================================================
+
+hbase shell
+
+create 'custmaster', 'customer'
+
+quit
+
+
+1. Import using sqoop from db into hbase custmaster data and save the output log into a log file.
+--------------------------------------------------------------------------------------------------
+
+sqoop import --connect jdbc:mysql://inceptez/custdb --username root --password root --table custmaster \
+--hbase-create-table --hbase-table custmaster --column-family customer --hbase-row-key id -m 1 -validate &> /tmp/sqoop.log
+
+
+
+2. Validate the sqoop import is properly happened using --validate option in sqoop and create a _SUCCESS file if the validation is successful 
+-----------------------------------------------------------------------------------------------------------------------------------------------
+in /home/hduser/creditcard_insurance location.
+--------------------------------------------------
+
+if [ `cat /tmp/sqoop.log | grep "Data successfully validated" | wc -l` -eq 1 ]
+then
+touch /home/hduser/creditcard_insurance/_HBASE_SUCCESS
+fi
+
+
+Data movement & migration from Hive to HBase using Storage Handler
+----------------------------------------------------------------------
+
+Use insure;
+drop table if exists insurancehive;
+
+
+CREATE TABLE insurancehive (idkey int, issuerid int,id int,businessyear int,statedesc string,networkurl
+string,pay int,defaulter string,billamt int,newbillamt float,penality float)
+STORED BY 'org.apache.hadoop.hive.hbase.HBaseStorageHandler' WITH SERDEPROPERTIES
+("hbase.columns.mapping" =
+":key,insurance:issuerid,insurance:id,insurance:businessyear,insurance:statedesc,insurance:networkurl,
+creditcard:pay,creditcard:defaulter,creditcard:billamt,creditcard:newbillamt,creditcard:penality")
+TBLPROPERTIES ("hbase.table.name" = "insurancehive",
+"hbase.mapred.output.outputtable"="insurancehive");
+
+
+Insert incremental rowkey as the row_key into HBASE.
+-----------------------------------------------------
+
+insert into table insurancehive select row_number() over() as
+idkey,issuerid,id,businessyear,statedesc,networkurl,pay,defaulter,billamt,newbillamt,penality
+from insuranceorc where issuerid is not null;
+
+
+Data Provisioning to the Consumers using Apache Phoenix to support Realtime aggregation and Low Latency Query processing
+------------------------------------------------------------------------------------------------------------------------------
+
+Create a phoenix table view on the above hbase table and analyze profession based total payment and average payment.
+----------------------------------------------------------------------------------------------------------------------
+
+echo "scan 'insurancehive'" | hbase shell | awk -F'=' '{print $2}' | awk -F ':' '{print $2}'|awk -F ',' '{print $1}'
+
+
+create view "insurancehive" (idkey varchar(100) primary key,"insurance"."issuerid"
+varchar,"insurance"."id" varchar,"insurance"."businessyear" varchar,"insurance"."statedesc"
+varchar,"insurance"."networkurl" varchar,"creditcard"."pay" varchar,"creditcard"."defaulter"
+varchar,"creditcard"."billamt" varchar,"creditcard"."newbillamt" varchar,"creditcard"."penality"
+varchar);
+
+
+create view "custmaster" (id varchar primary key,"customer"."fname"
+varchar,"customer"."lname" varchar,"customer"."profession" varchar,"customer"."ageval" varchar);
+
+
+select next value for cubeseq as id,lvl, avg_age, sum_billamt, avg_billamt, avg_newbillamt 
+from 
+(
+ select 1 as lvl,"profession",avg(cast(to_number("ageval") as integer)) as avg_age ,0 as sum_billamt,0 as avg_billamt,0 as avg_newbillamt
+ from "custmaster" group by lvl,"profession"
+ union all
+ select 2 as lvl,"profession", cast(to_number("ageval") as integer) as avg_age ,0 as sum_billamt,0 as avg_billamt,0 as avg_newbillamt
+ from "custmaster"
+ union all
+ select 3 as lvl,"custmaster"."profession",0 as avg_age,sum(cast(to_number("insurancehive"."billamt") as bigint)) as sum_billamt,
+ avg(cast(to_number("insurancehive"."newbillamt") as double)) as avg_billamt,avg(cast(to_number("insurancehive"."newbillamt") as double)) as avg_newbillamt
+ from "insurancehive" as i inner join "custmaster" as c on "insurancehive"."id"=c.id
+ group by "custmaster"."profession"
+) as temp
+order by lvl;
+
+
+select next value for cubeseq as id,lvl, avg_age, sum_billamt, avg_billamt, avg_newbillamt 
+from 
+(
+ select 1 as lvl,"profession",avg(cast(to_number("ageval") as integer)) as avg_age ,0 as sum_billamt,0 as avg_billamt,0 as avg_newbillamt
+ from "custmaster" group by lvl,"profession"
+ union all
+ select 2 as lvl,"profession", cast(to_number("ageval") as integer) as avg_age ,0 as sum_billamt,0 as avg_billamt,0 as avg_newbillamt
+ from "custmaster"
+ union all
+ select 3 as lvl,"custmaster"."profession",0 as avg_age,sum(cast(to_number("insurancehive"."billamt") as bigint)) as sum_billamt,
+ avg(cast(to_number("insurancehive"."newbillamt") as double)) as avg_billamt,avg(cast(to_number("insurancehive"."newbillamt") as double)) as avg_newbillamt
+ from "insurancehive" as i inner join "custmaster" as c on "insurancehive"."id"=c.id
+ group by "custmaster"."profession"
+) as temp
+order by lvl;
+
+
+
+
+
